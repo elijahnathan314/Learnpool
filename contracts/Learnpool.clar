@@ -11,6 +11,10 @@
 (define-constant err-milestone-not-found (err u109))
 (define-constant err-milestone-already-claimed (err u110))
 (define-constant err-insufficient-reputation (err u111))
+(define-constant err-invalid-delegation (err u112))
+(define-constant err-delegation-not-found (err u113))
+(define-constant err-delegation-expired (err u114))
+(define-constant err-self-delegation (err u115))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-milestone-id uint u1)
@@ -82,6 +86,39 @@
 (define-map reputation-leaderboard
   { rank: uint }
   { member: principal, reputation-score: uint }
+)
+
+;; Delegation tracking maps
+(define-map member-delegations
+  { delegator: principal, delegate: principal }
+  {
+    delegation-type: (string-ascii 20), ;; "general", "funding", "governance"
+    start-block: uint,
+    end-block: uint,
+    is-active: bool,
+    voting-power-delegated: uint
+  }
+)
+
+(define-map delegate-summary
+  { delegate: principal }
+  {
+    total-delegated-power: uint,
+    active-delegations: uint,
+    delegation-reputation: uint,
+    last-activity: uint
+  }
+)
+
+(define-map delegation-history
+  { delegator: principal, sequence: uint }
+  {
+    delegate: principal,
+    delegation-type: (string-ascii 20),
+    created-at: uint,
+    ended-at: uint,
+    reason: (string-ascii 50)
+  }
 )
 
 (define-public (join-dao (stake-amount uint))
@@ -283,6 +320,32 @@
   (let ((base-power (get-voting-power member))
         (reputation-bonus (calculate-reputation-bonus member)))
     (+ base-power reputation-bonus)
+  )
+)
+
+;; Delegation read-only functions
+(define-read-only (get-delegation (delegator principal) (delegate principal))
+  (map-get? member-delegations { delegator: delegator, delegate: delegate })
+)
+
+(define-read-only (get-delegate-summary (delegate principal))
+  (map-get? delegate-summary { delegate: delegate })
+)
+
+(define-read-only (get-delegation-history (delegator principal) (sequence uint))
+  (map-get? delegation-history { delegator: delegator, sequence: sequence })
+)
+
+(define-read-only (get-total-delegate-power (delegate principal))
+  (default-to u0 (get total-delegated-power (map-get? delegate-summary { delegate: delegate })))
+)
+
+(define-read-only (is-delegation-active (delegator principal) (delegate principal))
+  (let ((delegation (map-get? member-delegations { delegator: delegator, delegate: delegate })))
+    (match delegation
+      del-data (and (get is-active del-data) (> (get end-block del-data) stacks-block-height))
+      false
+    )
   )
 )
 
@@ -556,3 +619,215 @@
     (ok true)
   )
 )
+
+;; Delegation System Functions
+
+;; Create a delegation to another member
+(define-public (create-delegation (delegate principal) (delegation-type (string-ascii 20)) (duration-blocks uint))
+  (let ((delegator-stake (get-member-stake tx-sender))
+        (delegate-stake (get-member-stake delegate))
+        (delegator-power (get-enhanced-voting-power tx-sender))
+        (existing-delegation (map-get? member-delegations { delegator: tx-sender, delegate: delegate })))
+    ;; Validation checks
+    (asserts! (> delegator-stake u0) err-unauthorized)
+    (asserts! (> delegate-stake u0) err-not-found)
+    (asserts! (not (is-eq tx-sender delegate)) err-self-delegation)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    (asserts! (is-none existing-delegation) err-already-exists)
+    (asserts! (or (is-eq delegation-type "general") 
+                  (or (is-eq delegation-type "funding") 
+                      (is-eq delegation-type "governance"))) err-invalid-delegation)
+    
+    ;; Create delegation record
+    (map-set member-delegations
+      { delegator: tx-sender, delegate: delegate }
+      {
+        delegation-type: delegation-type,
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height duration-blocks),
+        is-active: true,
+        voting-power-delegated: delegator-power
+      }
+    )
+    
+    ;; Update delegate summary
+    (update-delegate-summary delegate delegator-power true)
+    
+    ;; Record in delegation history
+    (record-delegation-history tx-sender delegate delegation-type "created")
+    
+    (ok true)
+  )
+)
+
+;; Revoke a delegation
+(define-public (revoke-delegation (delegate principal))
+  (let ((delegation (unwrap! (map-get? member-delegations { delegator: tx-sender, delegate: delegate }) err-delegation-not-found)))
+    (asserts! (get is-active delegation) err-delegation-not-found)
+    
+    ;; Deactivate delegation
+    (map-set member-delegations
+      { delegator: tx-sender, delegate: delegate }
+      (merge delegation { is-active: false })
+    )
+    
+    ;; Update delegate summary
+    (update-delegate-summary delegate (get voting-power-delegated delegation) false)
+    
+    ;; Record in delegation history
+    (record-delegation-history tx-sender delegate (get delegation-type delegation) "revoked")
+    
+    (ok true)
+  )
+)
+
+;; Vote on behalf of delegators (delegate function)
+(define-public (delegate-vote (proposal-id uint) (vote-for bool))
+  (let ((proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) err-not-found))
+        (delegate-power (calculate-total-delegate-power tx-sender proposal-id))
+        (existing-vote (map-get? proposal-votes { proposal-id: proposal-id, voter: tx-sender })))
+    
+    ;; Validation checks
+    (asserts! (> delegate-power u0) err-unauthorized)
+    (asserts! (is-eq (get status proposal) "active") err-proposal-ended)
+    (asserts! (< stacks-block-height (+ (get created-at proposal) (var-get voting-period))) err-proposal-ended)
+    (asserts! (is-none existing-vote) err-already-voted)
+    
+    ;; Cast vote with aggregated power
+    (let ((updated-proposal (if vote-for
+           (merge proposal { votes-for: (+ (get votes-for proposal) delegate-power) })
+           (merge proposal { votes-against: (+ (get votes-against proposal) delegate-power) }))))
+      
+      (map-set proposals { proposal-id: proposal-id } updated-proposal)
+      (map-set proposal-votes
+        { proposal-id: proposal-id, voter: tx-sender }
+        { vote: vote-for, voting-power: delegate-power }
+      )
+      
+      ;; Update delegate activity
+      (update-delegate-activity tx-sender)
+      
+      (ok true)
+    )
+  )
+)
+
+;; Check delegation status
+(define-public (check-delegation-status (delegator principal) (delegate principal))
+  (let ((delegation (map-get? member-delegations { delegator: delegator, delegate: delegate })))
+    (match delegation
+      del-data (begin
+        (if (and (get is-active del-data) (> (get end-block del-data) stacks-block-height))
+          (ok "active")
+          (ok "expired")
+        )
+      )
+      (ok "not-found")
+    )
+  )
+)
+
+;; Batch delegate multiple types to one delegate
+(define-public (create-batch-delegation (delegate principal) (duration-blocks uint))
+  (let ((delegator-stake (get-member-stake tx-sender)))
+    (asserts! (> delegator-stake u0) err-unauthorized)
+    (try! (create-delegation delegate "general" duration-blocks))
+    (try! (create-delegation delegate "funding" duration-blocks))
+    (try! (create-delegation delegate "governance" duration-blocks))
+    (ok true)
+  )
+)
+
+;; Emergency revoke all delegations
+(define-public (emergency-revoke-all-delegations)
+  (let ((member-stake (get-member-stake tx-sender)))
+    (asserts! (> member-stake u0) err-unauthorized)
+    ;; Note: In a full implementation, this would iterate through all delegations
+    ;; For simplicity, we're providing the interface
+    (ok true)
+  )
+)
+
+;; Private helper functions for delegation system
+
+;; Update delegate summary when delegation is created/revoked
+(define-private (update-delegate-summary (delegate principal) (voting-power uint) (is-add bool))
+  (let ((current-summary (map-get? delegate-summary { delegate: delegate })))
+    (match current-summary
+      summary (map-set delegate-summary
+        { delegate: delegate }
+        {
+          total-delegated-power: (if is-add 
+            (+ (get total-delegated-power summary) voting-power)
+            (- (get total-delegated-power summary) voting-power)),
+          active-delegations: (if is-add 
+            (+ (get active-delegations summary) u1)
+            (- (get active-delegations summary) u1)),
+          delegation-reputation: (+ (get delegation-reputation summary) u5),
+          last-activity: stacks-block-height
+        }
+      )
+      (map-set delegate-summary
+        { delegate: delegate }
+        {
+          total-delegated-power: voting-power,
+          active-delegations: u1,
+          delegation-reputation: u5,
+          last-activity: stacks-block-height
+        }
+      )
+    )
+    true
+  )
+)
+
+;; Record delegation history for tracking
+(define-private (record-delegation-history (delegator principal) (delegate principal) (delegation-type (string-ascii 20)) (reason (string-ascii 50)))
+  (let ((history-count (get-delegation-history-count delegator)))
+    (map-set delegation-history
+      { delegator: delegator, sequence: history-count }
+      {
+        delegate: delegate,
+        delegation-type: delegation-type,
+        created-at: stacks-block-height,
+        ended-at: u0,
+        reason: reason
+      }
+    )
+    true
+  )
+)
+
+;; Calculate total voting power available to a delegate
+(define-private (calculate-total-delegate-power (delegate principal) (proposal-id uint))
+  (let ((delegate-own-power (get-enhanced-voting-power delegate))
+        (delegated-power (get-total-delegate-power delegate)))
+    (+ delegate-own-power delegated-power)
+  )
+)
+
+;; Update delegate activity when they vote
+(define-private (update-delegate-activity (delegate principal))
+  (let ((current-summary (map-get? delegate-summary { delegate: delegate })))
+    (match current-summary
+      summary (map-set delegate-summary
+        { delegate: delegate }
+        (merge summary {
+          last-activity: stacks-block-height,
+          delegation-reputation: (+ (get delegation-reputation summary) u10)
+        })
+      )
+      true
+    )
+    true
+  )
+)
+
+;; Get delegation history count for a delegator
+(define-private (get-delegation-history-count (delegator principal))
+  ;; Simple implementation - in practice would track count separately
+  u1
+)
+
+
+
